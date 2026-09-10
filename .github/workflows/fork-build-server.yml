@@ -1,0 +1,57 @@
+# Fork-only: build the linux/arm64 remux-server binary on a GitHub arm runner
+# and publish it as a workflow artifact, so a patched image can be assembled
+# locally (FROM ghcr.io/lostb1t/remux:<tag> + COPY remux-server) without a
+# local Rust toolchain. Mirrors the build-server leg of build.yml. Not for
+# upstream.
+name: Fork build (server arm64)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fmt:
+    name: rustfmt check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  test:
+    name: Test
+    uses: ./.github/workflows/test.yml
+
+  build-server-arm64:
+    name: Build server (linux-arm64)
+    runs-on: ubuntu-24.04-arm
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: server-arm64
+      - name: Build remux-server
+        env:
+          SQLX_OFFLINE: "true"
+        run: cargo build --release --target aarch64-unknown-linux-gnu -p remux-server
+      - name: Upload server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-linux-arm64
+          path: target/aarch64-unknown-linux-gnu/release/remux-server
+          retention-days: 3
