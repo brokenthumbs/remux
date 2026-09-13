@@ -1639,7 +1639,7 @@ impl Media {
     /// albums, episodes, seasons, and TV programs, storing them as `self.parent` /
     /// `self.grandparent`. The API layer reads titles and image tags from those
     /// preloaded records instead of from flat denormalised fields.
-    pub async fn preload_parents(db: &SqlitePool, records: &mut Vec<Self>) {
+    pub async fn preload_parents(db: &SqlitePool, records: &mut [Self]) {
         let ids_needed: Vec<Uuid> = records
             .iter()
             .filter(|m| {
@@ -1978,6 +1978,7 @@ pub enum MediaError {
 // doesn't coerce across storage classes in a bare `=`), so integer-valued
 // fields must bind as an integer, not a stringified one. Used by
 // `Media::find_by_external_ids` and `Media::resolve_ambiguous_external_id`.
+#[derive(Clone, PartialEq)]
 enum IdValue {
     Text(String),
     Int(i64),
@@ -2773,11 +2774,168 @@ impl Media {
     /// imdb ▸ custom_stremio_id ▸ tmdb ▸ tvdb ▸ kitsu, or deezer ▸ youtube_id
     /// for music) and the conflict is logged — this is intentionally not
     /// resolved by merging the rows.
-    pub async fn find_by_external_ids(
+    /// Point remote results (search, catalog) that already exist locally at
+    /// their stored row: same kind, matching external id. The whole item is
+    /// replaced with the stored row, not just its id — a remote addon's
+    /// payload can drift from what's actually stored (a user's manual edit,
+    /// `is_locked`/`locked_fields`, images), and the moment a client opens
+    /// the item it gets the stored row anyway (`resolve_item` →
+    /// `get_by_id`), so showing the remote version in the interim is
+    /// actively misleading, not just differently fresh. The remote result's
+    /// `relations` (catalog membership, attached by the caller after
+    /// conversion) is preserved across the swap since it isn't a stored
+    /// column and carries no bearing on which row is correct.
+    ///
+    /// Remote results are minted with a fresh id per request and live in the
+    /// in-memory store for an hour. A client that keeps such an id, for
+    /// next-episode autoplay or a continue-watching entry, is left with a
+    /// dead one after that, or after a restart, and gets 404 on
+    /// `/shows/{id}/seasons` while the stored series is fine. Only results
+    /// with a matching row are rewritten; unknown items keep their id.
+    pub async fn adopt_existing_rows(db: &SqlitePool, items: &mut [Media]) {
+        let mut kinds: Vec<MediaKind> = Vec::new();
+        for m in items.iter() {
+            // `ExternalIds::is_empty()` only looks at imdb/tmdb/tvdb/custom —
+            // checking it here would skip Artist/Album/Track kinds, whose
+            // only identity is deezer_*/youtube_id, entirely.
+            // `external_id_fields` covers every kind correctly.
+            if !Self::external_id_fields(&m.kind, &m.external_ids).is_empty()
+                && !kinds.contains(&m.kind)
+            {
+                kinds.push(
+                    m.kind
+                        .clone(),
+                );
+            }
+        }
+        for kind in kinds {
+            let exts: Vec<ExternalIds> = items
+                .iter()
+                .filter(|m| m.kind == kind)
+                .map(|m| {
+                    m.external_ids
+                        .clone()
+                })
+                .collect();
+            let rows = Self::get_many_by_external_ids(db, &kind, &exts).await;
+            if rows.is_empty() {
+                continue;
+            }
+            for m in items
+                .iter_mut()
+                .filter(|m| m.kind == kind)
+            {
+                let fields = Self::external_id_fields(&kind, &m.external_ids);
+                let hit = fields
+                    .iter()
+                    .find_map(|field| {
+                        rows.iter()
+                            .find(|row| {
+                                Self::external_id_fields(&kind, &row.external_ids)
+                                    .contains(field)
+                            })
+                    });
+                if let Some(stored) = hit {
+                    let relations = m
+                        .relations
+                        .take();
+                    *m = stored.clone();
+                    m.relations = relations;
+                }
+            }
+        }
+        // A swapped-in stored row carries none of the remote result's
+        // preloaded parent/grandparent stubs (Track/Album's artist/album
+        // name and artwork, Episode/Season/TvProgram's series) — re-run
+        // unconditionally so the invariant holds regardless of whether the
+        // caller already preloaded before calling this.
+        Self::preload_parents(db, items).await;
+    }
+
+    /// Appends `kind = ? AND (json_extract(external_ids, '$.a') = ? OR
+    /// json_extract(external_ids, '$.b') = ? OR ...)` for `fields` (which
+    /// must be non-empty) to `qb`. Shared by every external-id lookup below
+    /// so the WHERE-clause shape lives in exactly one place.
+    fn push_external_id_where(
+        qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
+        kind: &MediaKind,
+        fields: &[(&'static str, IdValue)],
+    ) {
+        qb.push("kind = ");
+        qb.push_bind(kind.to_string());
+        qb.push(" AND (");
+        for (i, (path, value)) in fields
+            .iter()
+            .enumerate()
+        {
+            if i > 0 {
+                qb.push(" OR ");
+            }
+            qb.push("json_extract(external_ids, '")
+                .push(path)
+                .push("') = ");
+            match value {
+                IdValue::Text(s) => qb.push_bind(s.clone()),
+                IdValue::Int(n) => qb.push_bind(*n),
+            };
+        }
+        qb.push(")");
+    }
+
+    /// Like `find_by_external_ids`, but for many items of the same `kind`
+    /// at once — one query (per `SQLITE_VAR_LIMIT` chunk) instead of one per
+    /// `ext`. Returns every stored row (images included) that shares any
+    /// external id with any of `exts`; callers match each of their own
+    /// items against this set themselves; matches only need to be
+    /// deduplicated, not returned in caller order.
+    async fn get_many_by_external_ids(
         db: &SqlitePool,
         kind: &MediaKind,
+        exts: &[ExternalIds],
+    ) -> Vec<Media> {
+        let mut wanted: Vec<(&'static str, IdValue)> = Vec::new();
+        for ext in exts {
+            for field in Self::external_id_fields(kind, ext) {
+                if !wanted.contains(&field) {
+                    wanted.push(field);
+                }
+            }
+        }
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for chunk in wanted.chunks(SQLITE_VAR_LIMIT - 1) {
+            let mut qb = sqlx::QueryBuilder::new("SELECT * FROM media WHERE ");
+            Self::push_external_id_where(&mut qb, kind, chunk);
+            let mut rows: Vec<Media> = qb
+                .build_query_as()
+                .fetch_all(db)
+                .await
+                .unwrap_or_default();
+            let ids: Vec<Uuid> = rows
+                .iter()
+                .map(|m| m.id)
+                .collect();
+            let mut images = MediaImage::get_for_media_ids(db, &ids)
+                .await
+                .unwrap_or_default();
+            for row in &mut rows {
+                row.images = images
+                    .remove(&row.id)
+                    .unwrap_or_default();
+            }
+            out.extend(rows);
+        }
+        out
+    }
+
+    /// `(json path, bound value)` pairs identifying `ext` for `kind`, in
+    /// priority order.
+    fn external_id_fields(
+        kind: &MediaKind,
         ext: &ExternalIds,
-    ) -> Option<Uuid> {
+    ) -> Vec<(&'static str, IdValue)> {
         // (json path, bound value) in priority order — mirrors stable_media_uuid
         // for Movie/Series/TvProgram; Artist/Album/Track have no priority
         // conflict since each carries at most one provider's id in practice.
@@ -2824,32 +2982,23 @@ impl Media {
             // Season/Episode identity is positional (parent series + index),
             // not a single external id — never deduped this way, their ids
             // are minted deterministically via `season_id`/`episode_id`.
-            _ => return None,
+            _ => {}
         }
+        id_fields
+    }
+
+    pub async fn find_by_external_ids(
+        db: &SqlitePool,
+        kind: &MediaKind,
+        ext: &ExternalIds,
+    ) -> Option<Uuid> {
+        let id_fields = Self::external_id_fields(kind, ext);
         if id_fields.is_empty() {
             return None;
         }
 
-        let mut qb =
-            sqlx::QueryBuilder::new("SELECT DISTINCT id FROM media WHERE kind = ");
-        qb.push_bind(kind.to_string());
-        qb.push(" AND (");
-        for (i, (path, value)) in id_fields
-            .iter()
-            .enumerate()
-        {
-            if i > 0 {
-                qb.push(" OR ");
-            }
-            qb.push("json_extract(external_ids, '")
-                .push(path)
-                .push("') = ");
-            match value {
-                IdValue::Text(s) => qb.push_bind(s.clone()),
-                IdValue::Int(n) => qb.push_bind(*n),
-            };
-        }
-        qb.push(")");
+        let mut qb = sqlx::QueryBuilder::new("SELECT DISTINCT id FROM media WHERE ");
+        Self::push_external_id_where(&mut qb, kind, &id_fields);
 
         let rows: Vec<Uuid> = qb
             .build_query_scalar()
@@ -2890,25 +3039,9 @@ impl Media {
         // `ORDER BY CASE ... END LIMIT 1` — one query picks the
         // strongest match directly, instead of probing each field
         // with a separate round trip.
-        let mut qb = sqlx::QueryBuilder::new("SELECT id FROM media WHERE kind = ");
-        qb.push_bind(kind.to_string());
-        qb.push(" AND (");
-        for (i, (path, value)) in id_fields
-            .iter()
-            .enumerate()
-        {
-            if i > 0 {
-                qb.push(" OR ");
-            }
-            qb.push("json_extract(external_ids, '")
-                .push(path)
-                .push("') = ");
-            match value {
-                IdValue::Text(s) => qb.push_bind(s.clone()),
-                IdValue::Int(n) => qb.push_bind(*n),
-            };
-        }
-        qb.push(") ORDER BY CASE");
+        let mut qb = sqlx::QueryBuilder::new("SELECT id FROM media WHERE ");
+        Self::push_external_id_where(&mut qb, kind, &id_fields);
+        qb.push(" ORDER BY CASE");
         for (i, (path, value)) in id_fields
             .iter()
             .enumerate()
