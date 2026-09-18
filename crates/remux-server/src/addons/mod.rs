@@ -2502,6 +2502,18 @@ impl AddonService {
             {
                 Ok(Some(mut results)) => {
                     db::Media::adopt_existing_rows(&ctx.db, &mut results).await;
+                    tracing::info!(
+                        target: "remux_server::dupe",
+                        "search-return kind={:?} query={:?} -> {} items: [{}]",
+                        kind,
+                        query,
+                        results.len(),
+                        results
+                            .iter()
+                            .map(|m| format!("{}|{:?}|{:?}", m.id, m.title, m.external_ids))
+                            .collect::<Vec<_>>()
+                            .join(" ; ")
+                    );
                     for m in &results {
                         ctx.store
                             .save(

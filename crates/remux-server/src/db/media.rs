@@ -2877,11 +2877,22 @@ impl Media {
                             })
                     });
                 if let Some(stored) = hit {
+                    tracing::info!(
+                        target: "remux_server::dupe",
+                        "adopt kind={:?} title={:?} stub_id={} stub_ext={:?} -> stored_id={} stored_ext={:?}",
+                        kind, m.title, m.id, m.external_ids, stored.id, stored.external_ids
+                    );
                     let relations = m
                         .relations
                         .take();
                     *m = stored.clone();
                     m.relations = relations;
+                } else {
+                    tracing::info!(
+                        target: "remux_server::dupe",
+                        "no-adopt kind={:?} title={:?} stub_id={} stub_ext={:?}",
+                        kind, m.title, m.id, m.external_ids
+                    );
                 }
             }
         }
