@@ -1,0 +1,44 @@
+name: Fork build server (arm64)
+
+# Fork-only: builds just the linux/arm64 remux-server release binary and uploads
+# it as the artifact `server-linux-arm64`. We layer that binary onto the matching
+# upstream image (ghcr.io/lostb1t/remux:0.32.0) locally via remux/patched/Dockerfile
+# to run localhost/remux:patched — the mini can't compile Rust (OOMs the 8 GB VM),
+# so GitHub's arm runner does the build. Mirrors upstream build.yml's build-server
+# arm64 leg (pkg-config/libssl-dev, dtolnay toolchain, SQLX_OFFLINE, cargo target).
+on:
+  workflow_dispatch:
+
+jobs:
+  build-server-arm64:
+    name: Build remux-server (linux/arm64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: fork-server-arm64
+
+      - name: Build remux-server
+        env:
+          SQLX_OFFLINE: "true"
+        run: cargo build --release --target aarch64-unknown-linux-gnu -p remux-server
+
+      - name: Upload server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-linux-arm64
+          path: target/aarch64-unknown-linux-gnu/release/remux-server
+          retention-days: 3

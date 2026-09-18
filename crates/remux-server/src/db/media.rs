@@ -7212,6 +7212,26 @@ impl TryFrom<sdks::stremio::Meta> for Media {
         };
 
         let mut media = media;
+        // Derive the search stub's id from its own canonical external id the
+        // way a stored row's id is derived (stable_media_uuid via
+        // Uuid::from(&MediaIdRaw)), instead of a random Uuid::new_v4(). Without
+        // this, every search for a not-yet-stored title mints a fresh id, and
+        // opening the title (which resolves an imdb id and adopts the stored
+        // row's id) changes it again — so a Jellyfin client that keys cards by
+        // id shows the same title twice (one pre-tap "no rating" card, one
+        // post-tap "with rating" card). A provider-derived id makes the first
+        // search and every search after agree, and survives the tap unchanged.
+        // Guarded on canonical().is_some() so id-less stubs (which would all
+        // collapse to stable_media_uuid(kind, "") and collide) keep a random
+        // id. Re-adds the TryFrom<Meta> half of upstream PR #465 that #479
+        // dropped when it merged only the adopt-existing-rows layer.
+        let raw = media.media_id_raw();
+        if raw
+            .canonical()
+            .is_some()
+        {
+            media.id = Uuid::from(&raw);
+        }
         if let Some(url) = meta
             .poster
             .or(meta.thumbnail)
