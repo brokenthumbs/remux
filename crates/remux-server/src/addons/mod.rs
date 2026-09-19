@@ -2502,6 +2502,38 @@ impl AddonService {
             {
                 Ok(Some(mut results)) => {
                     db::Media::adopt_existing_rows(&ctx.db, &mut results).await;
+                    // UHF duplicate-search-card fix (2026-09-19).
+                    // After adoption, any result STILL missing imdb is a brand-new
+                    // discovery (no stored row matched). Freshly discovered stubs come
+                    // back TMDB-only; imdb is otherwise resolved lazily — only when the
+                    // user taps the show — so the FIRST search returns the item imdb-less
+                    // and a later search returns the SAME Jellyfin id but now carrying
+                    // imdb. UHF keys its search cards by the imdb ProviderId (not the
+                    // Jellyfin id), so it cannot reconcile the two and renders the show
+                    // twice (one "no rating" stub + one enriched). Resolve the external
+                    // ids HERE, before returning, so every search response carries imdb
+                    // from the first hit. Then re-derive the id (canonical() prefers imdb)
+                    // so it stays stable across searches — mirrors TryFrom<Meta> in
+                    // db/media.rs. Adoption ran first so already-stored shows cost no
+                    // TMDB call; only genuine first-discoveries hit this path.
+                    if matches!(kind, db::MediaKind::Movie | db::MediaKind::Series) {
+                        for m in results.iter_mut() {
+                            if m.external_ids
+                                .imdb
+                                .is_none()
+                            {
+                                MediaResolveService::resolve_external_ids(m, ctx, false)
+                                    .await;
+                                let raw = m.media_id_raw();
+                                if raw
+                                    .canonical()
+                                    .is_some()
+                                {
+                                    m.id = Uuid::from(&raw);
+                                }
+                            }
+                        }
+                    }
                     tracing::info!(
                         target: "remux_server::dupe",
                         "search-return kind={:?} query={:?} -> {} items: [{}]",
